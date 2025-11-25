@@ -1,26 +1,8 @@
-' =============================================================
-'  Word Mendeley Citation Linker (VBA)
-'  Author: Bhuwan Awasthi
-'  Version: 1.0 (Refactored GPL Edition)
-'  License: GNU General Public License v3.0 or later
-'
-'  This program is free software: you can redistribute it and/or modify
-'  it under the terms of the GNU General Public License as published by
-'  the Free Software Foundation, either version 3 of the License, or
-'  (at your option) any later version.
-'
-'  This program is distributed in the hope that it will be useful,
-'  but WITHOUT ANY WARRANTY; without even the implied warranty of
-'  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-'  GNU General Public License for more details.
-'
-'  You should have received a copy of the GNU General Public License
-'  along with this program.  If not, see <https://www.gnu.org/licenses/>.
-' =============================================================
 Option Explicit
 
 ' Paste this entire module into a new Module in Word VBA and run LinkMendeleyCitations_Try2
 ' Run on a copy of your document. Check Immediate window (Ctrl+G) for diagnostics.
+' FIXED: Now properly handles multiple citations in a single bracket (e.g., "Aryal et al., 2025; Paudel et al., 2020")
 
 Public Sub LinkMendeleyCitations_Try2()
     Dim doc As Document: Set doc = ActiveDocument
@@ -98,15 +80,37 @@ Public Sub LinkMendeleyCitations_Try2()
         Dim cci As ContentControl: Set cci = citeCCs(i)
         Dim raw As String: raw = cci.Range.Text
         If Len(Trim$(raw)) = 0 Then GoTo NextCC
-        Dim tokens() As String: tokens = Split(raw, ";") ' split by semicolon
-        Dim searchPos As Long: searchPos = 1
-
+        
+        ' Split by semicolon to get individual citations
+        Dim tokens() As String: tokens = Split(raw, ";")
+        Dim tokenCount As Long: tokenCount = UBound(tokens) - LBound(tokens) + 1
+        
+        ' Pre-calculate all token info BEFORE adding any hyperlinks
+        Dim tokenInfos() As Variant
+        ReDim tokenInfos(LBound(tokens) To UBound(tokens))
+        
         Dim j As Long
+        Dim searchPos As Long: searchPos = 1
+        
+        ' First pass: gather all token information
         For j = LBound(tokens) To UBound(tokens)
             Dim tokRaw As String: tokRaw = Trim$(tokens(j))
-            If Len(tokRaw) = 0 Then GoTo NextTok
             Dim tokNorm As String: tokNorm = NormalizeToken(tokRaw)
-
+            
+            ' Create info array: (0)=tokRaw, (1)=tokNorm, (2)=pos, (3)=surname, (4)=year, (5)=bookmark
+            Dim info(0 To 5) As Variant
+            info(0) = tokRaw
+            info(1) = tokNorm
+            info(2) = 0 ' position - will be calculated
+            info(3) = "" ' surname
+            info(4) = "" ' year
+            info(5) = "" ' bookmark
+            
+            If Len(tokRaw) = 0 Then
+                tokenInfos(j) = info
+                GoTo NextTokenPrep
+            End If
+            
             ' attempt tag extraction
             Dim bestSurname As String: bestSurname = ""
             Dim bestYear As String: bestYear = ""
@@ -120,104 +124,194 @@ Public Sub LinkMendeleyCitations_Try2()
             ' fallback parsing
             If Len(bestSurname) = 0 Then bestSurname = ExtractFirstAuthorFromCitation(tokNorm)
             If Len(bestYear) = 0 Then bestYear = ExtractYearFromCitationText(tokNorm)
+            
+            info(3) = bestSurname
+            info(4) = bestYear
 
             If Len(bestSurname) = 0 Then
                 unmatched("CC:" & cci.Range.Start & ":" & j) = tokRaw
                 Debug.Print "No surname extracted for token [" & tokRaw & "] CCStart=" & cci.Range.Start
-                GoTo NextTok
+                tokenInfos(j) = info
+                GoTo NextTokenPrep
             End If
 
             ' Find candidate bookmark using enhanced resolver
             Dim candBk As String
             candBk = ResolveCandidate2(surnameMap, surnameYearMap, bookmarkTextMap, refKeyMap, bestSurname, bestYear, tokRaw, tokNorm)
+            info(5) = candBk
 
             ' locate token in CC visible text robustly
             Dim pos As Long: pos = FindTokenPosition(searchPos, raw, tokRaw)
             If pos = 0 Then pos = FindTokenPosition(searchPos, raw, tokNorm)
             If pos = 0 Then pos = FindTokenPosition(searchPos, raw, TrimPunctuation(tokNorm))
-
+            
+            info(2) = pos
+            
             If pos > 0 Then
-                Dim r As Range: Set r = cci.Range.Duplicate
-                r.Start = cci.Range.Start + pos - 1
-                Dim vis As String: vis = tokRaw
-                r.End = r.Start + Len(vis)
-                If r.Hyperlinks.Count = 0 Then
-                    If Len(candBk) > 0 Then
-                        On Error Resume Next
-                        doc.Hyperlinks.Add Anchor:=r, Address:="", SubAddress:=candBk, TextToDisplay:=r.Text
-                        If Err.Number = 0 Then
-                            created = created + 1
-                            Debug.Print "Linked CC token -> " & candBk & " | CCStart=" & cci.Range.Start & " token=" & Left$(vis, 80)
-                        Else
-                            unmatched("CCaddErr:" & cci.Range.Start & ":" & j) = tokRaw
-                            Debug.Print "Err adding hyperlink: " & Err.Number & " " & Err.Description
-                            Err.Clear
-                        End If
-                        On Error GoTo 0
-                    Else
-                        unmatched("CCnomatch:" & cci.Range.Start & ":" & j) = tokRaw
-                        Debug.Print "No candidate bookmark for seg: [" & tokRaw & "] at CCStart=" & cci.Range.Start
-                    End If
-                Else
-                    Debug.Print "Already hyperlinked (skip). CCStart=" & cci.Range.Start & " token=" & Left$(vis, 60)
-                End If
                 searchPos = pos + Len(tokRaw)
-            Else
-                unmatched("CCnoloc:" & cci.Range.Start & ":" & j) = tokRaw
-                Debug.Print "Could not locate token text [" & tokRaw & "] inside CC visible text at CCStart=" & cci.Range.Start
             End If
-
-NextTok:
+            
+            tokenInfos(j) = info
+NextTokenPrep:
+        Next j
+        
+        ' Second pass: Add hyperlinks in REVERSE order to avoid position shifts
+        For j = UBound(tokens) To LBound(tokens) Step -1
+            Dim tInfo As Variant: tInfo = tokenInfos(j)
+            Dim tRaw As String: tRaw = tInfo(0)
+            Dim tNorm As String: tNorm = tInfo(1)
+            Dim tPos As Long: tPos = tInfo(2)
+            Dim tSurname As String: tSurname = tInfo(3)
+            Dim tYear As String: tYear = tInfo(4)
+            Dim tBookmark As String: tBookmark = tInfo(5)
+            
+            If Len(tRaw) = 0 Then GoTo NextTokenAdd
+            If tPos = 0 Then
+                If Len(tSurname) > 0 Then
+                    unmatched("CCnoloc:" & cci.Range.Start & ":" & j) = tRaw
+                    Debug.Print "Could not locate token text [" & tRaw & "] inside CC visible text at CCStart=" & cci.Range.Start
+                End If
+                GoTo NextTokenAdd
+            End If
+            
+            ' Re-read the CC range start (it may have shifted from previous hyperlinks in this loop)
+            Dim currentCCStart As Long: currentCCStart = cci.Range.Start
+            
+            Dim r As Range: Set r = cci.Range.Duplicate
+            r.Start = currentCCStart + tPos - 1
+            r.End = r.Start + Len(tRaw)
+            
+            ' Validate range is within CC
+            If r.Start < currentCCStart Or r.End > cci.Range.End Then
+                Debug.Print "Range out of bounds for token [" & tRaw & "] - skipping"
+                GoTo NextTokenAdd
+            End If
+            
+            If r.Hyperlinks.Count = 0 Then
+                If Len(tBookmark) > 0 Then
+                    On Error Resume Next
+                    doc.Hyperlinks.Add Anchor:=r, Address:="", SubAddress:=tBookmark, TextToDisplay:=r.Text
+                    If Err.Number = 0 Then
+                        created = created + 1
+                        Debug.Print "Linked CC token -> " & tBookmark & " | CCStart=" & currentCCStart & " token=" & Left$(tRaw, 80)
+                    Else
+                        unmatched("CCaddErr:" & cci.Range.Start & ":" & j) = tRaw
+                        Debug.Print "Err adding hyperlink: " & Err.Number & " " & Err.Description
+                        Err.Clear
+                    End If
+                    On Error GoTo 0
+                Else
+                    unmatched("CCnomatch:" & cci.Range.Start & ":" & j) = tRaw
+                    Debug.Print "No candidate bookmark for seg: [" & tRaw & "] at CCStart=" & currentCCStart
+                End If
+            Else
+                Debug.Print "Already hyperlinked (skip). CCStart=" & currentCCStart & " token=" & Left$(tRaw, 60)
+            End If
+NextTokenAdd:
         Next j
 NextCC:
     Next i
 
-    ' - Process fields (similar logic)
+    ' - Process fields (similar logic with reverse processing)
     For i = 1 To fieldList.Count
         Dim fld As Field: Set fld = fieldList(i)
         Dim fRaw As String: fRaw = fld.Result.Text
         If Len(Trim$(fRaw)) = 0 Then GoTo NextField
+        
         Dim fTokens() As String: fTokens = Split(fRaw, ";")
+        Dim fTokenInfos() As Variant
+        ReDim fTokenInfos(LBound(fTokens) To UBound(fTokens))
+        
         Dim fSearch As Long: fSearch = 1
         Dim k As Long
+        
+        ' First pass: gather all token info
         For k = LBound(fTokens) To UBound(fTokens)
             Dim fTokRaw As String: fTokRaw = Trim$(fTokens(k))
-            If Len(fTokRaw) = 0 Then GoTo NextFT
             Dim fTokNorm As String: fTokNorm = NormalizeToken(fTokRaw)
+            
+            Dim fInfo(0 To 5) As Variant
+            fInfo(0) = fTokRaw
+            fInfo(1) = fTokNorm
+            fInfo(2) = 0
+            fInfo(3) = ""
+            fInfo(4) = ""
+            fInfo(5) = ""
+            
+            If Len(fTokRaw) = 0 Then
+                fTokenInfos(k) = fInfo
+                GoTo NextFTPrep
+            End If
+            
             Dim fSurname As String: fSurname = ExtractFirstAuthorFromCitation(fTokNorm)
             Dim fYear As String: fYear = ExtractYearFromCitationText(fTokNorm)
-            If Len(fSurname) = 0 Then unmatched("Fldnm:" & fld.Result.Start & ":" & k) = fTokRaw: GoTo NextFT
+            
+            fInfo(3) = fSurname
+            fInfo(4) = fYear
+            
+            If Len(fSurname) = 0 Then
+                unmatched("Fldnm:" & fld.Result.Start & ":" & k) = fTokRaw
+                fTokenInfos(k) = fInfo
+                GoTo NextFTPrep
+            End If
 
-            Dim cand As String
-            cand = ResolveCandidate2(surnameMap, surnameYearMap, bookmarkTextMap, refKeyMap, fSurname, fYear, fTokRaw, fTokNorm)
+            Dim fCand As String
+            fCand = ResolveCandidate2(surnameMap, surnameYearMap, bookmarkTextMap, refKeyMap, fSurname, fYear, fTokRaw, fTokNorm)
+            fInfo(5) = fCand
 
             Dim posf As Long: posf = FindTokenPosition(fSearch, fRaw, fTokRaw)
             If posf = 0 Then posf = FindTokenPosition(fSearch, fRaw, fTokNorm)
+            
+            fInfo(2) = posf
+            
             If posf > 0 Then
-                Dim rf As Range: Set rf = fld.Result.Duplicate
-                rf.Start = fld.Result.Start + posf - 1
-                Dim vF As String: vF = fTokRaw
-                rf.End = rf.Start + Len(vF)
-                If rf.Hyperlinks.Count = 0 Then
-                    If Len(cand) > 0 Then
-                        On Error Resume Next
-                        doc.Hyperlinks.Add Anchor:=rf, Address:="", SubAddress:=cand, TextToDisplay:=rf.Text
-                        If Err.Number = 0 Then
-                            created = created + 1
-                        Else
-                            unmatched("FldAddErr:" & fld.Result.Start & ":" & k) = fTokRaw
-                            Err.Clear
-                        End If
-                        On Error GoTo 0
-                    Else
-                        unmatched("FldNoMatch:" & fld.Result.Start & ":" & k) = fTokRaw
-                    End If
-                End If
                 fSearch = posf + Len(fTokRaw)
-            Else
-                unmatched("FldNoLoc:" & fld.Result.Start & ":" & k) = fTokRaw
             End If
-NextFT:
+            
+            fTokenInfos(k) = fInfo
+NextFTPrep:
+        Next k
+        
+        ' Second pass: Add hyperlinks in REVERSE order
+        For k = UBound(fTokens) To LBound(fTokens) Step -1
+            Dim fTInfo As Variant: fTInfo = fTokenInfos(k)
+            Dim ftRaw As String: ftRaw = fTInfo(0)
+            Dim ftNorm As String: ftNorm = fTInfo(1)
+            Dim ftPos As Long: ftPos = fTInfo(2)
+            Dim ftSurname As String: ftSurname = fTInfo(3)
+            Dim ftYear As String: ftYear = fTInfo(4)
+            Dim ftBookmark As String: ftBookmark = fTInfo(5)
+            
+            If Len(ftRaw) = 0 Then GoTo NextFTAdd
+            If ftPos = 0 Then
+                If Len(ftSurname) > 0 Then
+                    unmatched("FldNoLoc:" & fld.Result.Start & ":" & k) = ftRaw
+                End If
+                GoTo NextFTAdd
+            End If
+            
+            Dim currentFldStart As Long: currentFldStart = fld.Result.Start
+            
+            Dim rf As Range: Set rf = fld.Result.Duplicate
+            rf.Start = currentFldStart + ftPos - 1
+            rf.End = rf.Start + Len(ftRaw)
+            
+            If rf.Hyperlinks.Count = 0 Then
+                If Len(ftBookmark) > 0 Then
+                    On Error Resume Next
+                    doc.Hyperlinks.Add Anchor:=rf, Address:="", SubAddress:=ftBookmark, TextToDisplay:=rf.Text
+                    If Err.Number = 0 Then
+                        created = created + 1
+                    Else
+                        unmatched("FldAddErr:" & fld.Result.Start & ":" & k) = ftRaw
+                        Err.Clear
+                    End If
+                    On Error GoTo 0
+                Else
+                    unmatched("FldNoMatch:" & fld.Result.Start & ":" & k) = ftRaw
+                End If
+            End If
+NextFTAdd:
         Next k
 NextField:
     Next i
@@ -329,7 +423,7 @@ Private Sub BuildReferenceBookmarksAndMaps2(doc As Document, refsRange As Range,
 
             ' also add first 2-4 words normalized as keys
             Dim w() As String: w = Split(StripPunctuation(line), " ")
-            Dim num As Long, k As Long
+            Dim num As Long, kk As Long
             If UBound(w) >= 0 Then
                 num = UBound(w) + 1
                 If num > 4 Then num = 4
@@ -337,15 +431,15 @@ Private Sub BuildReferenceBookmarksAndMaps2(doc As Document, refsRange As Range,
                 num = 0
             End If
             Dim sKey As String: sKey = ""
-            For k = 0 To num - 1
-                If Len(w(k)) > 0 Then
-                    If sKey = "" Then sKey = LCase$(w(k)) Else sKey = sKey & " " & LCase$(w(k))
+            For kk = 0 To num - 1
+                If Len(w(kk)) > 0 Then
+                    If sKey = "" Then sKey = LCase$(w(kk)) Else sKey = sKey & " " & LCase$(w(kk))
                     Dim sKeyNorm As String: sKeyNorm = Trim$(TrimPunctuation(OnlyAlphaNumericShort(sKey)))
                     If Len(sKeyNorm) >= 3 Then
                         If Not refKeyMap.Exists(sKeyNorm) Then refKeyMap.Add sKeyNorm, uniqueName
                     End If
                 End If
-            Next k
+            Next kk
 
             Debug.Print "Bookmark: " & uniqueName & " -> " & Left$(line, 140)
         Else
@@ -380,10 +474,10 @@ Private Function ResolveCandidate2(surnameMap As Object, surnameYearMap As Objec
     End If
 
     ' 3) try visible-token substring in any bookmark text
-    Dim k As Variant
-    For Each k In bookmarkTextMap.Keys
-        If InStr(1, bookmarkTextMap(k), visibleToken, vbTextCompare) > 0 Then ResolveCandidate2 = k: Exit Function
-    Next k
+    Dim kk As Variant
+    For Each kk In bookmarkTextMap.Keys
+        If InStr(1, bookmarkTextMap(kk), visibleToken, vbTextCompare) > 0 Then ResolveCandidate2 = kk: Exit Function
+    Next kk
 
     ' 4) try normalized visibleNorm in refKeyMap
     Dim lookupKey As String: lookupKey = LCase$(Trim$(OnlyAlphaNumericShort(visibleNorm)))
@@ -392,11 +486,11 @@ Private Function ResolveCandidate2(surnameMap As Object, surnameYearMap As Objec
     End If
 
     ' 5) try any bookmark which contains the surname (word)
-    For Each k In bookmarkTextMap.Keys
-        If InStr(1, " " & LCase$(bookmarkTextMap(k)) & " ", " " & LCase$(surname) & " ", vbTextCompare) > 0 Then
-            ResolveCandidate2 = k: Exit Function
+    For Each kk In bookmarkTextMap.Keys
+        If InStr(1, " " & LCase$(bookmarkTextMap(kk)) & " ", " " & LCase$(surname) & " ", vbTextCompare) > 0 Then
+            ResolveCandidate2 = kk: Exit Function
         End If
-    Next k
+    Next kk
 
     ' 6) fallback: if surnameMap has candidates, return first
     If surnameMap.Exists(sKey) Then
@@ -500,11 +594,11 @@ Private Function ExtractFirstAuthorFromCitation(token As String) As String
         If Len(OnlyLetters(leftPart)) >= 2 Then ExtractFirstAuthorFromCitation = OnlyLetters(leftPart): Exit Function
     End If
     Dim words() As String: words = Split(s, " ")
-    Dim i As Long
-    For i = UBound(words) To LBound(words) Step -1
-        Dim w As String: w = Replace(Replace(words(i), ",", ""), ".", "")
-        If Len(OnlyLetters(w)) >= 2 Then ExtractFirstAuthorFromCitation = OnlyLetters(w): Exit Function
-    Next i
+    Dim ii As Long
+    For ii = UBound(words) To LBound(words) Step -1
+        Dim ww As String: ww = Replace(Replace(words(ii), ",", ""), ".", "")
+        If Len(OnlyLetters(ww)) >= 2 Then ExtractFirstAuthorFromCitation = OnlyLetters(ww): Exit Function
+    Next ii
     If UBound(words) >= LBound(words) Then ExtractFirstAuthorFromCitation = OnlyLetters(words(0)) Else ExtractFirstAuthorFromCitation = ""
 End Function
 
@@ -512,17 +606,17 @@ End Function
 ' Year extraction (first 4-digit group)
 ' ----------------------------
 Private Function ExtractYearFromCitationText(s As String) As String
-    Dim i As Long, num As String: num = ""
-    For i = 1 To Len(s)
-        Dim ch As String: ch = Mid$(s, i, 1)
+    Dim ii As Long, num As String: num = ""
+    For ii = 1 To Len(s)
+        Dim ch As String: ch = Mid$(s, ii, 1)
         If ch Like "[0-9]" Then num = num & ch Else num = num & " "
-    Next i
+    Next ii
     num = Trim$(Replace(num, "  ", " "))
     Dim parts() As String: parts = Split(num, " ")
-    Dim p As Long
-    For p = LBound(parts) To UBound(parts)
-        If Len(parts(p)) = 4 Then ExtractYearFromCitationText = parts(p): Exit Function
-    Next p
+    Dim pp As Long
+    For pp = LBound(parts) To UBound(parts)
+        If Len(parts(pp)) = 4 Then ExtractYearFromCitationText = parts(pp): Exit Function
+    Next pp
     ExtractYearFromCitationText = ""
 End Function
 
@@ -531,11 +625,11 @@ End Function
 ' ----------------------------
 Private Function OnlyLetters(s As String) As String
     Dim out As String: out = ""
-    Dim i As Long, ch As String
-    For i = 1 To Len(s)
-        ch = Mid$(s, i, 1)
+    Dim ii As Long, ch As String
+    For ii = 1 To Len(s)
+        ch = Mid$(s, ii, 1)
         If ch Like "[A-Za-z]" Then out = out & ch
-    Next i
+    Next ii
     OnlyLetters = out
 End Function
 
@@ -549,9 +643,9 @@ Private Function TryGetSurnameFromTag(tagText As String, tokenIndex As Long) As 
     Dim pos As Long: pos = InStr(1, s, famKey, vbTextCompare)
     If pos = 0 Then TryGetSurnameFromTag = "": Exit Function
     Dim names As Collection: Set names = New Collection
-    Dim p As Long: p = 1
+    Dim pp As Long: pp = 1
     Do
-        pos = InStr(p, s, famKey, vbTextCompare)
+        pos = InStr(pp, s, famKey, vbTextCompare)
         If pos = 0 Then Exit Do
         Dim startQuote As Long: startQuote = InStr(pos + Len(famKey), s, """")
         If startQuote = 0 Then Exit Do
@@ -559,7 +653,7 @@ Private Function TryGetSurnameFromTag(tagText As String, tokenIndex As Long) As 
         If endQuote = 0 Then Exit Do
         Dim fam As String: fam = Mid$(s, startQuote + 1, endQuote - startQuote - 1)
         names.Add fam
-        p = endQuote + 1
+        pp = endQuote + 1
     Loop
     If names.Count = 0 Then TryGetSurnameFromTag = "": Exit Function
     Dim idx As Long: idx = tokenIndex + 1
@@ -604,16 +698,16 @@ End Function
 ' Remove punctuation but keep letters/numbers and single spaces (short normalized key)
 ' ----------------------------
 Private Function OnlyAlphaNumericShort(s As String) As String
-    Dim i As Long, ch As String, out As String
+    Dim ii As Long, ch As String, out As String
     out = ""
-    For i = 1 To Len(s)
-        ch = Mid$(s, i, 1)
+    For ii = 1 To Len(s)
+        ch = Mid$(s, ii, 1)
         If ch Like "[A-Za-z0-9]" Then
             out = out & ch
         ElseIf ch = " " Then
             If Right$(out, 1) <> " " Then out = out & " "
         End If
-    Next i
+    Next ii
     OnlyAlphaNumericShort = Trim$(LCase$(out))
 End Function
 
@@ -622,9 +716,9 @@ End Function
 ' Strip punctuation (keeps words separated by single space)
 ' ----------------------------
 Private Function StripPunctuation(s As String) As String
-    Dim i As Long, ch As String, out As String: out = ""
-    For i = 1 To Len(s)
-        ch = Mid$(s, i, 1)
+    Dim ii As Long, ch As String, out As String: out = ""
+    For ii = 1 To Len(s)
+        ch = Mid$(s, ii, 1)
         If ch Like "[A-Za-z0-9&]" Or ch = " " Then
             If ch = " " And Right$(out, 1) = " " Then
                 ' skip duplicate
@@ -634,7 +728,7 @@ Private Function StripPunctuation(s As String) As String
         Else
             out = out & " "
         End If
-    Next i
+    Next ii
     StripPunctuation = Trim$(out)
 End Function
 
@@ -646,5 +740,3 @@ Private Function BookmarkExistsInDoc(doc As Document, name As String) As Boolean
     BookmarkExistsInDoc = doc.Bookmarks.Exists(name)
     On Error GoTo 0
 End Function
-
-
